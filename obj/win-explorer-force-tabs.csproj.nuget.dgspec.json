@@ -1,0 +1,64 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Users\\nicklaus\\Code\\CSharp\\win-explorer-force-tab\\win-explorer-force-tabs.csproj": {}
+  },
+  "projects": {
+    "C:\\Users\\nicklaus\\Code\\CSharp\\win-explorer-force-tab\\win-explorer-force-tabs.csproj": {
+      "version": "0.10.0",
+      "restore": {
+        "projectUniqueName": "C:\\Users\\nicklaus\\Code\\CSharp\\win-explorer-force-tab\\win-explorer-force-tabs.csproj",
+        "projectName": "win-explorer-force-tabs",
+        "projectPath": "C:\\Users\\nicklaus\\Code\\CSharp\\win-explorer-force-tab\\win-explorer-force-tabs.csproj",
+        "packagesPath": "C:\\Users\\nicklaus\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\nicklaus\\Code\\CSharp\\win-explorer-force-tab\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\nicklaus\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net6.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net6.0-windows7.0": {
+            "targetAlias": "net6.0-windows",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net6.0-windows7.0": {
+          "targetAlias": "net6.0-windows",
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            },
+            "Microsoft.WindowsDesktop.App.WPF": {
+              "privateAssets": "none"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\6.0.424\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}
