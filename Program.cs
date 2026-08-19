@@ -33,7 +33,7 @@ internal static class Program
             return;
 
         InitializeLog();
-        Log($"START pid={Environment.ProcessId} version=1.0.0 log={LogPath}");
+        Log($"START pid={Environment.ProcessId} version=1.0.3 log={LogPath}");
         var watcher = new ExplorerWatcher();
         watcher.Run();
     }
@@ -807,6 +807,17 @@ internal static class Program
         {
             location = Environment.ExpandEnvironmentVariables(location ?? string.Empty).Trim();
 
+            // Explorer exposes the special per-user "User Files" view as the physical
+            // %USERPROFILE% path through the Shell automation APIs. Navigating another
+            // tab back to that filesystem path loses the virtual known-folder items
+            // (Desktop, Documents, Pictures, Music, Downloads, Videos, ...), especially
+            // when those folders have been redirected to other drives.
+            //
+            // When the source resolves exactly to the profile root, navigate to the
+            // User Files namespace object instead of the backing filesystem directory.
+            if (IsUserProfileRoot(location))
+                return "shell:::{59031A47-3F72-44A7-89C5-5595FE6B30EE}";
+
             // Same normalization used by ExplorerTabUtility for virtual Shell locations.
             if (location.StartsWith("::", StringComparison.Ordinal))
                 location = $"shell:{location}";
@@ -816,8 +827,54 @@ internal static class Program
             return location.Trim(' ', '/', '\\', '\n', '\'', '"').Replace('/', '\\');
         }
 
+        private static bool IsUserProfileRoot(string location)
+        {
+            try
+            {
+                var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (string.IsNullOrWhiteSpace(profile) || string.IsNullOrWhiteSpace(location))
+                    return false;
+
+                static string Canonicalize(string path)
+                {
+                    path = Environment.ExpandEnvironmentVariables(path).Trim().Trim('"');
+                    return Path.GetFullPath(path)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                }
+
+                return string.Equals(
+                    Canonicalize(location),
+                    Canonicalize(profile),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static string GetLocation(dynamic window)
         {
+            // Read the current folder from Explorer's active Shell view. Unlike
+            // Folder.Self.Path / LocationURL, this preserves virtual namespace
+            // identities (notably the special per-user folder that aggregates
+            // redirected Desktop/Documents/Pictures/etc.).
+            var shellViewLocation = GetShellViewParsingName(window);
+            if (!string.IsNullOrWhiteSpace(shellViewLocation))
+                return shellViewLocation;
+
+            // Fallbacks for cases where Explorer's active view is temporarily
+            // unavailable while a window/tab is being created.
+            try
+            {
+                dynamic folderItem = window.Document.Folder.Self;
+                string parsingPath =
+                    Convert.ToString(folderItem.ExtendedProperty("System.ParsingPath")) ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(parsingPath))
+                    return parsingPath;
+            }
+            catch { }
+
             try
             {
                 string path = Convert.ToString(window.Document.Folder.Self.Path) ?? string.Empty;
@@ -837,6 +894,83 @@ internal static class Program
             catch
             {
                 return string.Empty;
+            }
+        }
+
+        private static string GetShellViewParsingName(object comWindow)
+        {
+            IShellBrowser? browser = null;
+            object? shellViewObject = null;
+            object? folderObject = null;
+            nint pidl = 0;
+            nint displayName = 0;
+
+            try
+            {
+                if (comWindow is not IServiceProvider sp)
+                    return string.Empty;
+
+                var browserGuid = typeof(IShellBrowser).GUID;
+                var hr = sp.QueryService(ref browserGuid, ref browserGuid, out browser);
+                if (hr != 0 || browser is null)
+                    return string.Empty;
+
+                // Ask the actual displayed Shell view for its folder identity. This
+                // preserves virtual namespace folders even when Shell automation's
+                // Folder.Self.Path collapses them to a filesystem backing path.
+                hr = browser.QueryActiveShellView(out shellViewObject);
+                if (hr != 0 || shellViewObject is null)
+                    return string.Empty;
+
+                if (shellViewObject is not IFolderView folderView)
+                    return string.Empty;
+
+                var persistFolder2Guid = typeof(IPersistFolder2).GUID;
+                hr = folderView.GetFolder(ref persistFolder2Guid, out folderObject);
+                if (hr != 0 || folderObject is not IPersistFolder2 persistFolder2)
+                    return string.Empty;
+
+                hr = persistFolder2.GetCurFolder(out pidl);
+                if (hr != 0 || pidl == 0)
+                    return string.Empty;
+
+                hr = SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING, out displayName);
+                if (hr != 0 || displayName == 0)
+                    return string.Empty;
+
+                return Marshal.PtrToStringUni(displayName) ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+            finally
+            {
+                if (displayName != 0)
+                    Marshal.FreeCoTaskMem(displayName);
+                if (pidl != 0)
+                    Marshal.FreeCoTaskMem(pidl);
+
+                try
+                {
+                    if (folderObject is not null && Marshal.IsComObject(folderObject))
+                        Marshal.FinalReleaseComObject(folderObject);
+                }
+                catch { }
+
+                try
+                {
+                    if (shellViewObject is not null && Marshal.IsComObject(shellViewObject))
+                        Marshal.FinalReleaseComObject(shellViewObject);
+                }
+                catch { }
+
+                try
+                {
+                    if (browser is not null && Marshal.IsComObject(browser))
+                        Marshal.ReleaseComObject(browser);
+                }
+                catch { }
             }
         }
 
@@ -919,7 +1053,81 @@ internal static class Program
     {
         [PreserveSig]
         int GetWindow(out nint handle);
+
+        [PreserveSig]
+        int ContextSensitiveHelp([MarshalAs(UnmanagedType.Bool)] bool fEnterMode);
+
+        [PreserveSig]
+        int InsertMenusSB(nint hmenuShared, nint lpMenuWidths);
+
+        [PreserveSig]
+        int SetMenuSB(nint hmenuShared, nint holemenuRes, nint hwndActiveObject);
+
+        [PreserveSig]
+        int RemoveMenusSB(nint hmenuShared);
+
+        [PreserveSig]
+        int SetStatusTextSB([MarshalAs(UnmanagedType.LPWStr)] string pszStatusText);
+
+        [PreserveSig]
+        int EnableModelessSB([MarshalAs(UnmanagedType.Bool)] bool fEnable);
+
+        [PreserveSig]
+        int TranslateAcceleratorSB(ref Msg pmsg, ushort wID);
+
+        [PreserveSig]
+        int BrowseObject(nint pidl, uint wFlags);
+
+        [PreserveSig]
+        int GetViewStateStream(uint grfMode, out nint ppStrm);
+
+        [PreserveSig]
+        int GetControlWindow(uint id, out nint phwnd);
+
+        [PreserveSig]
+        int SendControlMsg(uint id, uint uMsg, nint wParam, nint lParam, out nint pret);
+
+        [PreserveSig]
+        int QueryActiveShellView([MarshalAs(UnmanagedType.Interface)] out object? ppshv);
+
+        [PreserveSig]
+        int OnViewWindowActive([MarshalAs(UnmanagedType.Interface)] object pshv);
+
+        [PreserveSig]
+        int SetToolbarItems(nint lpButtons, uint nButtons, uint uFlags);
     }
+
+    [ComImport]
+    [Guid("CDE725B0-CCC9-4519-917E-325D72FAB4CE")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFolderView
+    {
+        [PreserveSig]
+        int GetCurrentViewMode(out uint pViewMode);
+
+        [PreserveSig]
+        int SetCurrentViewMode(uint viewMode);
+
+        [PreserveSig]
+        int GetFolder(ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object? ppv);
+    }
+
+    [ComImport]
+    [Guid("1AC3D9F0-175C-11D1-95BE-00609797EA4F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPersistFolder2
+    {
+        [PreserveSig]
+        int GetClassID(out Guid pClassID);
+
+        [PreserveSig]
+        int Initialize(nint pidl);
+
+        [PreserveSig]
+        int GetCurFolder(out nint ppidl);
+    }
+
+    private const uint SIGDN_DESKTOPABSOLUTEPARSING = 0x80028000;
 
     private delegate void WinEventDelegate(
         nint hWinEventHook,
@@ -948,6 +1156,12 @@ internal static class Program
         public Point Pt;
         public uint LPrivate;
     }
+
+    [DllImport("shell32.dll")]
+    private static extern int SHGetNameFromIDList(
+        nint pidl,
+        uint sigdnName,
+        out nint ppszName);
 
     [DllImport("user32.dll")]
     private static extern nint SetWinEventHook(
