@@ -14,6 +14,8 @@ Windows uses `explorer.exe` for File Explorer but also for other Shell windows, 
 
 The program therefore checks for the actual Windows 11 File Explorer tab interface exposed through Microsoft UI Automation (`TabView`, `TabListView`, `TabItem` and `AddButton`). A window is handled only when this tab interface is present. This allows normal and virtual Explorer locations such as Home or This PC to be recognized while other Shell windows are left untouched.
 
+When the opened location is the Windows user profile root (`%USERPROFILE%`), the utility preserves the special **User Files** Shell view instead of reopening the physical path directly. This matters when known folders such as Desktop, Documents, Downloads, Music, Pictures or Videos have been redirected to other drives: Explorer keeps the normal user-folder presentation and the redirected locations are displayed correctly.
+
 ## Requirements
 
 - Windows 11
@@ -41,7 +43,15 @@ See `THIRD_PARTY_NOTICE.md` for attribution and license information.
 
 ## Version
 
-Initial release: **v0.10.0**.
+Current version: **v1.0.3**.
+
+### v1.0.3
+
+- Preserve the Windows **User Files** Shell view when `%USERPROFILE%` is opened.
+- Keep the expected Explorer presentation when known user folders have been redirected to other drives.
+- Continue to use ordinary filesystem paths for normal folders and Shell namespace destinations for virtual Explorer locations.
+
+Initial release: **v1.0.0**.
 
 ## License
 
