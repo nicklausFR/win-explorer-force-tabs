@@ -45,4 +45,4 @@ Initial release: **v0.10.0**.
 
 ## License
 
-MIT. See `LICENSE`.
+GPL-3.0-or-later. See `LICENSE`.
