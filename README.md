@@ -43,7 +43,13 @@ See `THIRD_PARTY_NOTICE.md` for attribution and license information.
 
 ## Version
 
-Current version: **v1.0.3**.
+Current version: **v1.0.4**.
+
+### v1.0.4
+
+- Cache File Explorer window qualification instead of repeatedly walking the full UI Automation tree.
+- Release Explorer tab and intermediate Shell COM objects deterministically.
+- Prevent memory growth during long-running background monitoring.
 
 ### v1.0.3
 

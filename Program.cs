@@ -33,7 +33,7 @@ internal static class Program
             return;
 
         InitializeLog();
-        Log($"START pid={Environment.ProcessId} version=1.0.3 log={LogPath}");
+        Log($"START pid={Environment.ProcessId} version=1.0.4 log={LogPath}");
         var watcher = new ExplorerWatcher();
         watcher.Run();
     }
@@ -62,6 +62,7 @@ internal static class Program
     {
         private readonly ConcurrentDictionary<nint, DateTime> _knownTopWindows = new();
         private readonly ConcurrentDictionary<nint, nint> _hiddenWindows = new();
+        private readonly ConcurrentDictionary<nint, byte> _qualifiedExplorerWindows = new();
         private readonly ManualResetEventSlim _hookReady = new(false);
         private WinEventDelegate? _showHookCallback;
         private nint _showHookHandle;
@@ -90,8 +91,16 @@ internal static class Program
 
         private void SnapshotExistingWindows()
         {
-            foreach (var w in EnumerateExplorerTabs())
-                _knownTopWindows.TryAdd(w.TopLevelHandle, DateTime.UtcNow);
+            var tabs = EnumerateExplorerTabs();
+            try
+            {
+                foreach (var w in tabs)
+                    _knownTopWindows.TryAdd(w.TopLevelHandle, DateTime.UtcNow);
+            }
+            finally
+            {
+                DisposeTabs(tabs);
+            }
         }
 
         private void StartShowHook()
@@ -163,6 +172,8 @@ internal static class Program
                 return;
             }
 
+            _qualifiedExplorerWindows[hWnd] = 0;
+
             // Do not touch windows already known at startup or windows merely being restored.
             if (_knownTopWindows.ContainsKey(hWnd))
                 return;
@@ -232,43 +243,53 @@ internal static class Program
         private void CheckForNewExplorerWindow()
         {
             var tabs = EnumerateExplorerTabs();
-            var topWindows = tabs.Select(t => t.TopLevelHandle).Where(h => h != 0).Distinct().ToArray();
-
-            foreach (var hWnd in topWindows)
+            try
             {
-                if (_knownTopWindows.ContainsKey(hWnd))
-                    continue;
+                var topWindows = tabs.Select(t => t.TopLevelHandle).Where(h => h != 0).Distinct().ToArray();
 
-                _knownTopWindows[hWnd] = DateTime.UtcNow;
-
-                var tabsInNewWindow = tabs.Where(t => t.TopLevelHandle == hWnd).ToArray();
-                if (tabsInNewWindow.Length != 1)
+                foreach (var hWnd in topWindows)
                 {
-                    RestoreHiddenWindow(hWnd);
-                    continue;
+                    if (_knownTopWindows.ContainsKey(hWnd))
+                        continue;
+
+                    _knownTopWindows[hWnd] = DateTime.UtcNow;
+
+                    var tabsInNewWindow = tabs.Where(t => t.TopLevelHandle == hWnd).ToArray();
+                    if (tabsInNewWindow.Length != 1)
+                    {
+                        RestoreHiddenWindow(hWnd);
+                        continue;
+                    }
+
+                    var target = ChooseTargetWindow(topWindows, hWnd, tabs);
+                    if (target == 0)
+                    {
+                        RestoreHiddenWindow(hWnd);
+                        continue; // First Explorer window: keep it.
+                    }
+
+                    // The EVENT_OBJECT_SHOW hook can fire before Explorer exposes its COM/UIA state.
+                    // At this point EnumerateExplorerTabs() has positively qualified this HWND
+                    // as a tab-capable File Explorer window, so it is safe to hide it.
+                    HideSourceWindow(hWnd);
+
+                    Log($"NEW sourceTop=0x{hWnd:X} sourceTab=0x{tabsInNewWindow[0].TabHandle:X} targetTop=0x{target:X} location={tabsInNewWindow[0].Location}");
+                    MoveWindowIntoTab(tabsInNewWindow[0], target);
+                    break;
                 }
 
-                var target = ChooseTargetWindow(topWindows, hWnd, tabs);
-                if (target == 0)
-                {
-                    RestoreHiddenWindow(hWnd);
-                    continue; // First Explorer window: keep it.
-                }
+                // Forget windows that no longer exist.
+                var alive = topWindows.ToHashSet();
+                foreach (var old in _knownTopWindows.Keys.Where(h => !alive.Contains(h)).ToArray())
+                    _knownTopWindows.TryRemove(old, out _);
 
-                // The EVENT_OBJECT_SHOW hook can fire before Explorer exposes its COM/UIA state.
-                // At this point EnumerateExplorerTabs() has positively qualified this HWND
-                // as a tab-capable File Explorer window, so it is safe to hide it.
-                HideSourceWindow(hWnd);
-
-                Log($"NEW sourceTop=0x{hWnd:X} sourceTab=0x{tabsInNewWindow[0].TabHandle:X} targetTop=0x{target:X} location={tabsInNewWindow[0].Location}");
-                MoveWindowIntoTab(tabsInNewWindow[0], target);
-                break;
+                foreach (var old in _qualifiedExplorerWindows.Keys.Where(h => !IsWindow(h)).ToArray())
+                    _qualifiedExplorerWindows.TryRemove(old, out _);
             }
-
-            // Forget windows that no longer exist.
-            var alive = topWindows.ToHashSet();
-            foreach (var old in _knownTopWindows.Keys.Where(h => !alive.Contains(h)).ToArray())
-                _knownTopWindows.TryRemove(old, out _);
+            finally
+            {
+                DisposeTabs(tabs);
+            }
         }
 
         private static nint ChooseTargetWindow(nint[] allWindows, nint source, List<ExplorerTab> tabs)
@@ -288,12 +309,22 @@ internal static class Program
             }
 
             _busy = true;
+            ExplorerTab? newTab = null;
             try
             {
-                var before = EnumerateExplorerTabs()
-                    .Where(t => t.TopLevelHandle == targetTopWindow)
-                    .Select(t => t.TabHandle)
-                    .ToHashSet();
+                HashSet<nint> before;
+                var beforeTabs = EnumerateExplorerTabs();
+                try
+                {
+                    before = beforeTabs
+                        .Where(t => t.TopLevelHandle == targetTopWindow)
+                        .Select(t => t.TabHandle)
+                        .ToHashSet();
+                }
+                finally
+                {
+                    DisposeTabs(beforeTabs);
+                }
 
                 var activeTab = FindWindowEx(targetTopWindow, 0, "ShellTabWindowClass", null);
                 if (activeTab == 0)
@@ -302,15 +333,17 @@ internal static class Program
                 // Ask Explorer itself to create a tab.
                 PostMessage(activeTab, WM_COMMAND, CmdNewTab, 0);
 
-                ExplorerTab? newTab = null;
                 var sw = Stopwatch.StartNew();
                 while (sw.ElapsedMilliseconds < 2500)
                 {
                     Thread.Sleep(50);
-                    newTab = EnumerateExplorerTabs().FirstOrDefault(t =>
+                    var currentTabs = EnumerateExplorerTabs();
+                    newTab = currentTabs.FirstOrDefault(t =>
                         t.TopLevelHandle == targetTopWindow &&
                         t.TabHandle != 0 &&
                         !before.Contains(t.TabHandle));
+
+                    DisposeTabs(currentTabs, newTab);
 
                     if (newTab is not null)
                         break;
@@ -384,6 +417,8 @@ internal static class Program
             }
             finally
             {
+                newTab?.Dispose();
+
                 // Covers early returns (no active tab, tab creation timeout, etc.).
                 if (IsWindow(source.TopLevelHandle) && _hiddenWindows.ContainsKey(source.TopLevelHandle))
                     RestoreHiddenWindow(source.TopLevelHandle);
@@ -392,7 +427,7 @@ internal static class Program
             }
         }
 
-        private static List<ExplorerTab> EnumerateExplorerTabs()
+        private List<ExplorerTab> EnumerateExplorerTabs()
         {
             var result = new List<ExplorerTab>();
             object? shell = null;
@@ -453,13 +488,19 @@ internal static class Program
                         // A window is eligible only if it exposes the actual Windows 11
                         // File Explorer tab strip through UI Automation. This intentionally
                         // accepts virtual File Explorer locations such as Home and This PC.
-                        if (!explorerUiCache.TryGetValue(top, out var isTabbedExplorer))
+                        if (_qualifiedExplorerWindows.ContainsKey(top))
+                        {
+                            explorerUiCache[top] = true;
+                        }
+                        else if (!explorerUiCache.TryGetValue(top, out var isTabbedExplorer))
                         {
                             isTabbedExplorer = HasExplorerTabStrip(top);
                             explorerUiCache[top] = isTabbedExplorer;
+                            if (isTabbedExplorer)
+                                _qualifiedExplorerWindows[top] = 0;
                         }
 
-                        if (!isTabbedExplorer)
+                        if (!explorerUiCache[top])
                         {
                             Marshal.FinalReleaseComObject(item);
                             continue;
@@ -495,6 +536,15 @@ internal static class Program
             }
 
             return result;
+        }
+
+        private static void DisposeTabs(IEnumerable<ExplorerTab> tabs, ExplorerTab? except = null)
+        {
+            foreach (var tab in tabs)
+            {
+                if (!ReferenceEquals(tab, except))
+                    tab.Dispose();
+            }
         }
 
 
@@ -853,38 +903,51 @@ internal static class Program
             }
         }
 
-        private static string GetLocation(dynamic window)
+        private static string GetLocation(object windowObject)
         {
             // Read the current folder from Explorer's active Shell view. Unlike
             // Folder.Self.Path / LocationURL, this preserves virtual namespace
             // identities (notably the special per-user folder that aggregates
             // redirected Desktop/Documents/Pictures/etc.).
-            var shellViewLocation = GetShellViewParsingName(window);
+            var shellViewLocation = GetShellViewParsingName(windowObject);
             if (!string.IsNullOrWhiteSpace(shellViewLocation))
                 return shellViewLocation;
 
             // Fallbacks for cases where Explorer's active view is temporarily
             // unavailable while a window/tab is being created.
+            object? document = null;
+            object? folder = null;
+            object? self = null;
             try
             {
-                dynamic folderItem = window.Document.Folder.Self;
+                dynamic window = windowObject;
+                document = window.Document;
+                dynamic dDocument = document;
+                folder = dDocument.Folder;
+                dynamic dFolder = folder;
+                self = dFolder.Self;
+                dynamic folderItem = self;
+
                 string parsingPath =
                     Convert.ToString(folderItem.ExtendedProperty("System.ParsingPath")) ?? string.Empty;
                 if (!string.IsNullOrWhiteSpace(parsingPath))
                     return parsingPath;
-            }
-            catch { }
 
-            try
-            {
-                string path = Convert.ToString(window.Document.Folder.Self.Path) ?? string.Empty;
+                string path = Convert.ToString(folderItem.Path) ?? string.Empty;
                 if (!string.IsNullOrWhiteSpace(path))
                     return path;
             }
             catch { }
+            finally
+            {
+                ReleaseComReference(self);
+                ReleaseComReference(folder);
+                ReleaseComReference(document);
+            }
 
             try
             {
+                dynamic window = windowObject;
                 string url = Convert.ToString(window.LocationURL) ?? string.Empty;
                 if (url.StartsWith("file:///", StringComparison.OrdinalIgnoreCase) &&
                     Uri.TryCreate(url, UriKind.Absolute, out var uri))
@@ -895,6 +958,19 @@ internal static class Program
             {
                 return string.Empty;
             }
+        }
+
+        private static void ReleaseComReference(object? value)
+        {
+            if (value is null)
+                return;
+
+            try
+            {
+                if (Marshal.IsComObject(value))
+                    Marshal.ReleaseComObject(value);
+            }
+            catch { }
         }
 
         private static string GetShellViewParsingName(object comWindow)
@@ -1012,14 +1088,16 @@ internal static class Program
 
     private sealed class ExplorerTab : IDisposable
     {
-        public dynamic ComWindow { get; }
+        private object? _comWindow;
+
+        public dynamic ComWindow => _comWindow ?? throw new ObjectDisposedException(nameof(ExplorerTab));
         public nint TabHandle { get; }
         public nint TopLevelHandle { get; }
         public string Location { get; }
 
         public ExplorerTab(object comWindow, nint tabHandle, nint topLevelHandle, string location)
         {
-            ComWindow = comWindow;
+            _comWindow = comWindow;
             TabHandle = tabHandle;
             TopLevelHandle = topLevelHandle;
             Location = location;
@@ -1027,10 +1105,14 @@ internal static class Program
 
         public void Dispose()
         {
+            var comWindow = Interlocked.Exchange(ref _comWindow, null);
+            if (comWindow is null)
+                return;
+
             try
             {
-                object o = ComWindow;
-                if (Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o);
+                if (Marshal.IsComObject(comWindow))
+                    Marshal.ReleaseComObject(comWindow);
             }
             catch { }
         }
